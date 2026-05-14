@@ -8,6 +8,18 @@ import https from 'https';
 import { ClientTransaction } from 'x-client-transaction-id';
 import { JSDOM } from 'jsdom';
 
+if (typeof ArrayBuffer.prototype.transfer !== 'function') {
+  Object.defineProperty(ArrayBuffer.prototype, 'transfer', {
+    value(newByteLength = this.byteLength) {
+      const length = Math.max(0, Number(newByteLength));
+      const next = new ArrayBuffer(length);
+      const source = new Uint8Array(this);
+      new Uint8Array(next).set(source.subarray(0, Math.min(source.byteLength, length)));
+      return next;
+    },
+  });
+}
+
 const BEARER =
   'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
 const UA =
