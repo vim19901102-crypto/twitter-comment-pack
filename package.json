@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node src/index.mjs",
+    "api": "node src/api-service.mjs",
     "setup": "node setup-wizard.mjs",
     "install-service": "node scripts/install-autostart.mjs",
     "postinstall": "patch-package"
