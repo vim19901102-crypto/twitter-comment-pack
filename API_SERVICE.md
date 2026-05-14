@@ -138,7 +138,21 @@ Mode 2: n8n only triggers account warmup.
 {}
 ```
 
-In this mode the service runs the existing warmup logic from the repo: it picks a configured reference target, generates an AI comment, then replies using the default cookie account.
+In this mode the service first uses `modeA.listIds` from `data/config.json`.
+It picks the newest eligible tweet from those lists, generates an AI comment, posts the reply, and returns:
+
+```json
+{
+  "ok": true,
+  "mode": "list",
+  "listId": "1234567890",
+  "targetUrl": "https://x.com/i/web/status/111",
+  "replyUrl": "https://x.com/i/web/status/222",
+  "comment": "Generated comment"
+}
+```
+
+If no list is configured, it falls back to the existing warmup logic from the repo.
 
 ## Health check
 

@@ -8,9 +8,9 @@ import fs from 'fs';
 import path from 'path';
 import { loadConfig } from './config.mjs';
 import { generateComment } from './lib/ai-commenter.mjs';
-import { postTweet, uploadMedia } from './lib/twitter-http.mjs';
+import { fetchListTweets, postTweet, uploadMedia } from './lib/twitter-http.mjs';
 import { detectLanguage } from './lib/language.mjs';
-import { initStore, markCommented } from './lib/store.mjs';
+import { alreadyCommented, initStore, markCommented } from './lib/store.mjs';
 import { runWarmup } from './warmup.mjs';
 
 const PORT = Number(process.env.PORT || process.env.API_PORT || 3009);
@@ -276,10 +276,69 @@ async function handleComment(cfg, body) {
   };
 }
 
+async function handleAiCommentFromLists(cfg, ctx) {
+  const listIds = cfg.modeA?.listIds || [];
+  if (!Array.isArray(listIds) || listIds.length === 0) return null;
+
+  const candidates = [];
+  const seen = new Set();
+  for (const listId of listIds) {
+    const tweets = await fetchListTweets(String(listId).trim(), ctx.cookiesFile, 30);
+    for (const tweet of tweets) {
+      if (!tweet.id || !tweet.fullText || tweet.fullText.length < 10) continue;
+      if (tweet.isRetweet || tweet.inReplyToStatusId) continue;
+      if (seen.has(tweet.id) || alreadyCommented(tweet.id)) continue;
+      seen.add(tweet.id);
+      candidates.push({ ...tweet, listId: String(listId).trim() });
+    }
+  }
+
+  candidates.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const target = candidates[0];
+  if (!target) {
+    return {
+      ok: true,
+      action: 'ai-comment',
+      mode: 'list',
+      accountId: ctx.accountId,
+      skipped: true,
+      reason: 'No eligible tweet found in configured lists',
+    };
+  }
+
+  const langSetting = ctx.lang || 'auto';
+  const lang = langSetting === 'auto' ? detectLanguage(target.fullText) : langSetting;
+  const comment = await generateComment({
+    tweetText: target.fullText,
+    lang,
+    style: ctx.style,
+    ai: cfg.ai,
+  });
+  const replyId = await postTweet(comment, ctx.cookiesFile, { replyToId: target.id });
+  markCommented(target.id, target.author || '');
+
+  return {
+    ok: true,
+    action: 'ai-comment',
+    mode: 'list',
+    accountId: ctx.accountId,
+    listId: target.listId,
+    targetTweetId: target.id,
+    targetAuthor: target.author,
+    targetUrl: `https://x.com/i/web/status/${target.id}`,
+    replyId,
+    replyUrl: replyId === 'ok' ? null : `https://x.com/i/web/status/${replyId}`,
+    comment,
+    lang,
+  };
+}
+
 async function handleAiComment(cfg, body) {
   const ctx = requestContext(cfg, body);
   const tweetId = parseTweetId(body.tweetId || body.replyToId || body.tweetUrl || body.url || body.link);
   if (!tweetId) {
+    const listResult = await handleAiCommentFromLists(cfg, ctx);
+    if (listResult) return listResult;
     await runWarmup({ ...cfg, cookiesFile: ctx.cookiesFile }, false);
     return {
       ok: true,
