@@ -1,5 +1,13 @@
 {
   "cookiesFile": "data/cookies.json",
+  "accounts": {
+    "acc_1": {
+      "cookiesFile": "data/cookies-acc-1.json"
+    },
+    "acc_2": {
+      "cookiesFile": "data/cookies-acc-2.json"
+    }
+  },
   "telegram": {
     "botToken": "123456:ABC...",
     "chatId": "123456789"
