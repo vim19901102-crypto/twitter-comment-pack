@@ -82,6 +82,63 @@ function httpRequest(method, hostname, apiPath, headers, body) {
   });
 }
 
+function formBody(values) {
+  return new URLSearchParams(values).toString();
+}
+
+function multipartBody(fields, file) {
+  const boundary = `----twitter-comment-pack-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const chunks = [];
+  for (const [name, value] of Object.entries(fields)) {
+    chunks.push(Buffer.from(`--${boundary}\r\n`));
+    chunks.push(Buffer.from(`Content-Disposition: form-data; name="${name}"\r\n\r\n`));
+    chunks.push(Buffer.from(String(value)));
+    chunks.push(Buffer.from('\r\n'));
+  }
+  chunks.push(Buffer.from(`--${boundary}\r\n`));
+  chunks.push(Buffer.from(`Content-Disposition: form-data; name="media"; filename="${file.filename || 'media'}"\r\n`));
+  chunks.push(Buffer.from(`Content-Type: ${file.mimeType || 'application/octet-stream'}\r\n\r\n`));
+  chunks.push(file.buffer);
+  chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  return {
+    body: Buffer.concat(chunks),
+    contentType: `multipart/form-data; boundary=${boundary}`,
+  };
+}
+
+async function makeUploadHeaders(method, apiPath, cookiesFilePath, contentType) {
+  const { cookieStr, ct0 } = readCookies(cookiesFilePath);
+  const ct = await getClientTransaction();
+  const txId = await ct.generateTransactionId(method, apiPath);
+  return {
+    authorization: BEARER,
+    cookie: cookieStr,
+    'x-csrf-token': ct0,
+    'x-client-transaction-id': txId,
+    'x-twitter-active-user': 'yes',
+    'x-twitter-auth-type': 'OAuth2Session',
+    'content-type': contentType,
+    'user-agent': UA,
+    accept: '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    referer: 'https://x.com/',
+    origin: 'https://x.com',
+  };
+}
+
+function parseJsonResponse(result, label) {
+  let data;
+  try {
+    data = JSON.parse(result.body || '{}');
+  } catch {
+    throw new Error(`${label} returned invalid JSON (${result.status}): ${String(result.body).slice(0, 200)}`);
+  }
+  if (result.status < 200 || result.status >= 300) {
+    throw new Error(`${label} failed (${result.status}): ${String(result.body).slice(0, 300)}`);
+  }
+  return data;
+}
+
 function readCookies(cookiesFilePath) {
   const raw = JSON.parse(fs.readFileSync(cookiesFilePath, 'utf-8'));
   const cookies = raw.cookies || [];
@@ -238,6 +295,77 @@ export async function postTweet(text, cookiesFilePath, options = {}) {
   }
   const data = JSON.parse(result.body);
   return data?.data?.create_tweet?.tweet_results?.result?.rest_id || 'ok';
+}
+
+export async function uploadMedia(buffer, mimeType, cookiesFilePath, options = {}) {
+  if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer);
+  if (!buffer.length) throw new Error('media file is empty');
+
+  const mediaType = mimeType || 'application/octet-stream';
+  const isVideo = mediaType.startsWith('video/');
+  const mediaCategory = options.mediaCategory || (isVideo ? 'tweet_video' : 'tweet_image');
+  const uploadPath = '/i/media/upload.json';
+
+  const initPayload = formBody({
+    command: 'INIT',
+    total_bytes: String(buffer.length),
+    media_type: mediaType,
+    media_category: mediaCategory,
+  });
+  let headers = await makeUploadHeaders('POST', uploadPath, cookiesFilePath, 'application/x-www-form-urlencoded');
+  headers['content-length'] = Buffer.byteLength(initPayload);
+  const initResult = await httpRequest('POST', 'upload.twitter.com', uploadPath, headers, initPayload);
+  const initData = parseJsonResponse(initResult, 'Media INIT');
+  const mediaId = initData.media_id_string || String(initData.media_id || '');
+  if (!mediaId) throw new Error('Media INIT did not return media_id');
+
+  const chunkSize = Number(process.env.TWITTER_UPLOAD_CHUNK_BYTES || 4 * 1024 * 1024);
+  let segmentIndex = 0;
+  for (let offset = 0; offset < buffer.length; offset += chunkSize) {
+    const chunk = buffer.subarray(offset, Math.min(offset + chunkSize, buffer.length));
+    const { body, contentType } = multipartBody(
+      {
+        command: 'APPEND',
+        media_id: mediaId,
+        segment_index: String(segmentIndex),
+      },
+      {
+        buffer: chunk,
+        filename: options.filename || 'media',
+        mimeType: mediaType,
+      },
+    );
+    headers = await makeUploadHeaders('POST', uploadPath, cookiesFilePath, contentType);
+    headers['content-length'] = body.length;
+    const appendResult = await httpRequest('POST', 'upload.twitter.com', uploadPath, headers, body);
+    if (appendResult.status < 200 || appendResult.status >= 300) {
+      throw new Error(`Media APPEND failed (${appendResult.status}): ${appendResult.body.slice(0, 300)}`);
+    }
+    segmentIndex += 1;
+  }
+
+  const finalizePayload = formBody({ command: 'FINALIZE', media_id: mediaId });
+  headers = await makeUploadHeaders('POST', uploadPath, cookiesFilePath, 'application/x-www-form-urlencoded');
+  headers['content-length'] = Buffer.byteLength(finalizePayload);
+  const finalizeResult = await httpRequest('POST', 'upload.twitter.com', uploadPath, headers, finalizePayload);
+  let finalizeData = parseJsonResponse(finalizeResult, 'Media FINALIZE');
+
+  let processing = finalizeData.processing_info;
+  while (processing && !['succeeded', 'failed'].includes(processing.state)) {
+    const waitSeconds = Math.max(1, Number(processing.check_after_secs || 2));
+    await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
+    const statusPath = `${uploadPath}?${formBody({ command: 'STATUS', media_id: mediaId })}`;
+    headers = await makeUploadHeaders('GET', statusPath, cookiesFilePath, 'application/x-www-form-urlencoded');
+    const statusResult = await httpRequest('GET', 'upload.twitter.com', statusPath, headers);
+    finalizeData = parseJsonResponse(statusResult, 'Media STATUS');
+    processing = finalizeData.processing_info;
+  }
+
+  if (processing?.state === 'failed') {
+    throw new Error(`Media processing failed: ${JSON.stringify(processing.error || processing).slice(0, 300)}`);
+  }
+
+  return mediaId;
 }
 
 export async function searchUserTweets(username, cookiesFilePath, count = 10) {

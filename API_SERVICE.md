@@ -61,12 +61,42 @@ For many accounts, add `accounts` and send `accountId` from n8n:
 
 ## POST /post
 
-Post a new text tweet.
+Post a new text tweet, or a tweet with one image/video.
 
 ```json
 {
   "accountId": "acc_1",
   "text": "Text from n8n"
+}
+```
+
+For one default cookie account, omit `accountId`.
+
+To post media from n8n Google Drive download, send `multipart/form-data`:
+
+- text field: `text`
+- binary file field: `source`
+
+To post media by public URL, send JSON:
+
+```json
+{
+  "text": "Caption from n8n",
+  "mediaUrl": "https://example.com/file.mp4"
+}
+```
+
+Supported common types: `image/jpeg`, `image/png`, `image/gif`, `image/webp`, `video/mp4`, `video/quicktime`.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "action": "post",
+  "accountId": "acc_1",
+  "tweetId": "123",
+  "url": "https://x.com/i/web/status/123"
 }
 ```
 
@@ -86,6 +116,8 @@ You can also send `tweetId` instead of `tweetUrl`.
 
 ## POST /ai-comment
 
+Generate an AI comment, then post it as a reply.
+
 Mode 1: n8n sends a target tweet.
 
 ```json
@@ -98,13 +130,15 @@ Mode 1: n8n sends a target tweet.
 }
 ```
 
+Current implementation requires `tweetText` because the existing repo does not yet include a reliable single-tweet fetch function.
+
 Mode 2: n8n only triggers account warmup.
 
 ```json
 {}
 ```
 
-In this mode the service runs the existing warmup logic from the repo.
+In this mode the service runs the existing warmup logic from the repo: it picks a configured reference target, generates an AI comment, then replies using the default cookie account.
 
 ## Health check
 

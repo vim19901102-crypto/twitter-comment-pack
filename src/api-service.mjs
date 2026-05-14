@@ -3,11 +3,12 @@
  * Uses Twitter/X web cookies from data/config.json, not the official Twitter API.
  */
 import http from 'http';
+import https from 'https';
 import fs from 'fs';
 import path from 'path';
 import { loadConfig } from './config.mjs';
 import { generateComment } from './lib/ai-commenter.mjs';
-import { postTweet } from './lib/twitter-http.mjs';
+import { postTweet, uploadMedia } from './lib/twitter-http.mjs';
 import { detectLanguage } from './lib/language.mjs';
 import { initStore, markCommented } from './lib/store.mjs';
 import { runWarmup } from './warmup.mjs';
@@ -15,7 +16,7 @@ import { runWarmup } from './warmup.mjs';
 const PORT = Number(process.env.PORT || process.env.API_PORT || 3009);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_TOKEN = process.env.API_SERVICE_TOKEN || process.env.N8N_API_TOKEN || '';
-const MAX_BODY_BYTES = Number(process.env.API_MAX_BODY_BYTES || 1024 * 1024);
+const MAX_BODY_BYTES = Number(process.env.API_MAX_BODY_BYTES || 512 * 1024 * 1024);
 
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
@@ -26,26 +27,69 @@ function sendJson(res, status, payload) {
   res.end(body);
 }
 
-function readJson(req) {
+function readRawBody(req) {
   return new Promise((resolve, reject) => {
-    let raw = '';
+    const chunks = [];
+    let size = 0;
     req.on('data', (chunk) => {
-      raw += chunk;
-      if (Buffer.byteLength(raw) > MAX_BODY_BYTES) {
+      chunks.push(chunk);
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
         reject(new Error('Request body too large'));
         req.destroy();
       }
     });
-    req.on('end', () => {
-      if (!raw.trim()) return resolve({});
-      try {
-        resolve(JSON.parse(raw));
-      } catch {
-        reject(new Error('Body must be valid JSON'));
-      }
-    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+function parseJsonBody(raw) {
+  const text = raw.toString('utf8');
+  if (!text.trim()) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('Body must be valid JSON');
+  }
+}
+
+function parseMultipartBody(raw, contentType) {
+  const boundaryMatch = /boundary=([^;]+)/i.exec(contentType || '');
+  if (!boundaryMatch) throw new Error('multipart boundary missing');
+  const boundary = `--${boundaryMatch[1].replace(/^"|"$/g, '')}`;
+  const body = raw.toString('latin1');
+  const parts = body.split(boundary).slice(1, -1);
+  const fields = {};
+  const files = [];
+
+  for (const part of parts) {
+    const normalized = part.replace(/^\r\n/, '').replace(/\r\n$/, '');
+    const headerEnd = normalized.indexOf('\r\n\r\n');
+    if (headerEnd < 0) continue;
+    const headerText = normalized.slice(0, headerEnd);
+    const contentText = normalized.slice(headerEnd + 4);
+    const disposition = /content-disposition:\s*form-data;([^\r\n]+)/i.exec(headerText)?.[1] || '';
+    const name = /name="([^"]+)"/i.exec(disposition)?.[1];
+    if (!name) continue;
+    const filename = /filename="([^"]*)"/i.exec(disposition)?.[1];
+    const mimeType = /content-type:\s*([^\r\n]+)/i.exec(headerText)?.[1]?.trim();
+    const content = Buffer.from(contentText, 'latin1');
+    if (filename !== undefined && filename !== '') {
+      files.push({ name, filename, mimeType: mimeType || 'application/octet-stream', buffer: content });
+    } else {
+      fields[name] = content.toString('utf8');
+    }
+  }
+
+  return { ...fields, files };
+}
+
+async function readBody(req) {
+  const raw = await readRawBody(req);
+  const contentType = String(req.headers['content-type'] || '');
+  if (contentType.includes('multipart/form-data')) return parseMultipartBody(raw, contentType);
+  return parseJsonBody(raw);
 }
 
 function requireToken(req) {
@@ -112,15 +156,105 @@ function requestContext(cfg, body) {
   };
 }
 
+function inferMimeFromName(filename = '') {
+  const ext = path.extname(filename).toLowerCase();
+  const map = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.mp4': 'video/mp4',
+    '.mov': 'video/quicktime',
+    '.m4v': 'video/mp4',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+function downloadUrl(url, redirectCount = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirectCount > 5) return reject(new Error('Too many mediaUrl redirects'));
+    const parsed = new URL(url);
+    const client = parsed.protocol === 'http:' ? http : https;
+    const req = client.get(parsed, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+        res.resume();
+        const nextUrl = new URL(res.headers.location, url).toString();
+        downloadUrl(nextUrl, redirectCount + 1).then(resolve, reject);
+        return;
+      }
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        reject(new Error(`mediaUrl download failed (${res.statusCode})`));
+        return;
+      }
+      const chunks = [];
+      let size = 0;
+      res.on('data', (chunk) => {
+        chunks.push(chunk);
+        size += chunk.length;
+        if (size > MAX_BODY_BYTES) {
+          req.destroy();
+          reject(new Error('Downloaded media is too large'));
+        }
+      });
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        const mimeType = String(res.headers['content-type'] || '').split(';')[0] || inferMimeFromName(parsed.pathname);
+        resolve({ buffer, mimeType, filename: path.basename(parsed.pathname) || 'media' });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(120000, () => {
+      req.destroy();
+      reject(new Error('mediaUrl download timeout'));
+    });
+  });
+}
+
+async function resolveMedia(body) {
+  const files = Array.isArray(body.files) ? body.files : [];
+  const file = files.find((item) => item.name === 'source' || item.name === 'media' || item.name === 'data') || files[0];
+  if (file) {
+    return {
+      buffer: file.buffer,
+      mimeType: file.mimeType || inferMimeFromName(file.filename),
+      filename: file.filename || 'media',
+    };
+  }
+
+  if (body.mediaBase64) {
+    return {
+      buffer: Buffer.from(String(body.mediaBase64), 'base64'),
+      mimeType: body.mediaType || body.mimeType || inferMimeFromName(body.filename),
+      filename: body.filename || 'media',
+    };
+  }
+
+  const mediaUrl = String(body.mediaUrl || body.link_media || '').trim();
+  if (mediaUrl) return downloadUrl(mediaUrl);
+  return null;
+}
+
 async function handlePost(cfg, body) {
   const ctx = requestContext(cfg, body);
   const text = cleanText(body.text || body.content || body.caption, 'text');
-  const tweetId = await postTweet(text, ctx.cookiesFile);
+  const media = await resolveMedia(body);
+  const mediaIds = [];
+  if (media) {
+    const mediaId = await uploadMedia(media.buffer, media.mimeType, ctx.cookiesFile, {
+      filename: media.filename,
+      mediaCategory: body.mediaCategory,
+    });
+    mediaIds.push(mediaId);
+  }
+  const tweetId = await postTweet(text, ctx.cookiesFile, { mediaIds });
   return {
     ok: true,
     action: 'post',
     accountId: ctx.accountId,
     tweetId,
+    mediaIds,
     url: tweetId === 'ok' ? null : `https://x.com/i/web/status/${tweetId}`,
   };
 }
@@ -191,7 +325,7 @@ async function route(req, res, cfg) {
     return sendJson(res, 401, { ok: false, error: 'Unauthorized' });
   }
 
-  const body = await readJson(req);
+  const body = await readBody(req);
   if (url.pathname === '/post') return sendJson(res, 200, await handlePost(cfg, body));
   if (url.pathname === '/comment') return sendJson(res, 200, await handleComment(cfg, body));
   if (url.pathname === '/ai-comment') return sendJson(res, 200, await handleAiComment(cfg, body));
