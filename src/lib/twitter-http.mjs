@@ -139,6 +139,24 @@ function parseJsonResponse(result, label) {
   return data;
 }
 
+function findTweetId(value, depth = 0) {
+  if (!value || depth > 8) return null;
+  if (typeof value !== 'object') return null;
+
+  if (typeof value.rest_id === 'string' && /^\d{10,25}$/.test(value.rest_id)) {
+    return value.rest_id;
+  }
+  if (typeof value.id_str === 'string' && /^\d{10,25}$/.test(value.id_str)) {
+    return value.id_str;
+  }
+
+  for (const child of Object.values(value)) {
+    const found = findTweetId(child, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
 function readCookies(cookiesFilePath) {
   const raw = JSON.parse(fs.readFileSync(cookiesFilePath, 'utf-8'));
   const cookies = raw.cookies || [];
@@ -294,7 +312,15 @@ export async function postTweet(text, cookiesFilePath, options = {}) {
     throw new Error(`CreateTweet failed (${result.status}): ${result.body.slice(0, 200)}`);
   }
   const data = JSON.parse(result.body);
-  return data?.data?.create_tweet?.tweet_results?.result?.rest_id || 'ok';
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new Error(`CreateTweet returned errors: ${JSON.stringify(data.errors).slice(0, 500)}`);
+  }
+  const tweetResult = data?.data?.create_tweet?.tweet_results?.result;
+  const tweetId = findTweetId(tweetResult);
+  if (!tweetId) {
+    throw new Error(`CreateTweet returned no tweet id: ${result.body.slice(0, 500)}`);
+  }
+  return tweetId;
 }
 
 export async function uploadMedia(buffer, mimeType, cookiesFilePath, options = {}) {
