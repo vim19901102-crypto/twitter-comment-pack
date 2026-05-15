@@ -72,9 +72,23 @@ Post a new text tweet, or a tweet with one image/video.
 
 For one default cookie account, omit `accountId`.
 
+To choose the cookie from n8n/Google Sheets per row, send:
+
+```json
+{
+  "accountId": "1942834876769787907",
+  "cookie": "[{\"name\":\"auth_token\",\"value\":\"...\"}]",
+  "text": "Text from n8n"
+}
+```
+
+The service stores that cookie temporarily under `data/runtime-cookies/` and uses it for this request.
+
 To post media from n8n Google Drive download, send `multipart/form-data`:
 
 - text field: `text`
+- accountId field: `accountId`
+- cookie field: `cookie`
 - binary file field: `source`
 
 To post media by public URL, send JSON:

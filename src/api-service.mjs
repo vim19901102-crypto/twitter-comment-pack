@@ -119,6 +119,50 @@ function normalizePath(filePath) {
   return path.isAbsolute(filePath) ? filePath : path.resolve(filePath);
 }
 
+function safeAccountId(value) {
+  return String(value || 'default').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) || 'default';
+}
+
+function parseCookieInput(rawCookie) {
+  if (!rawCookie) return null;
+  if (Array.isArray(rawCookie)) return { cookies: rawCookie };
+  if (typeof rawCookie === 'object') {
+    if (Array.isArray(rawCookie.cookies)) return rawCookie;
+    return { cookies: [rawCookie] };
+  }
+
+  const text = String(rawCookie).trim();
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return { cookies: parsed };
+    if (parsed && typeof parsed === 'object') {
+      if (Array.isArray(parsed.cookies)) return parsed;
+      return { cookies: [parsed] };
+    }
+  } catch {
+    throw new Error('cookie must be valid Cookie-Editor JSON');
+  }
+  return null;
+}
+
+function writeRuntimeCookie(body) {
+  const rawCookie = body.cookie || body.cookies || body.cookieJson || body.cookie_json;
+  const parsed = parseCookieInput(rawCookie);
+  if (!parsed) return null;
+  const names = new Set((parsed.cookies || []).map((cookie) => cookie.name));
+  if (!names.has('ct0') || !names.has('auth_token')) {
+    throw new Error('cookie must include ct0 and auth_token');
+  }
+
+  const accountId = safeAccountId(body.accountId || body.id_taikhoan || body.account || 'sheet');
+  const dir = path.resolve('data/runtime-cookies');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const cookiePath = path.join(dir, `${accountId}.json`);
+  fs.writeFileSync(cookiePath, JSON.stringify(parsed, null, 2));
+  return cookiePath;
+}
+
 function accountEntries(accounts) {
   if (!accounts) return [];
   if (Array.isArray(accounts)) return accounts;
@@ -130,6 +174,11 @@ function accountEntries(accounts) {
 
 function resolveCookiesFile(cfg, body) {
   const accountId = String(body.accountId || body.id_taikhoan || body.account || '').trim();
+  const runtimeCookiePath = writeRuntimeCookie(body);
+  if (runtimeCookiePath) {
+    return { accountId: accountId || 'sheet', cookiesFile: runtimeCookiePath };
+  }
+
   if (accountId) {
     const account = accountEntries(cfg.accounts).find((item) => {
       return String(item.id || item.accountId || item.id_taikhoan || '').trim() === accountId;
